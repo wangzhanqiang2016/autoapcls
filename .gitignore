@@ -1,0 +1,40 @@
+# === Java / Maven ===
+**/target/
+!.mvn/wrapper/maven-wrapper.jar
+*.class
+*.jar
+*.war
+
+# === Spring Boot ===
+*.log
+*.log.*
+
+# === Sensitive Config (contains real passwords/secrets) ===
+backend/src/main/resources/application.yml
+application-dev.yml
+application-prod.yml
+*.env
+*.env.local
+
+# === Node / Frontend ===
+frontend/node_modules/
+frontend/dist/
+
+# === IDE ===
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+*.swp
+*.swo
+*~
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Temp / Misc ===
+*.tmp
+*.bak
+.vite/
