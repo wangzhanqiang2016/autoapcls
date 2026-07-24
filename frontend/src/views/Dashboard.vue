@@ -1,8 +1,8 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useApCloseStore } from '@/store/apClose'
 import { useUserStore } from '@/store/user'
-import { getTaskDetail, executeStep, confirmStep } from '@/api/apClose'
+import { getTaskDetail, executeStep, confirmStep, getStepStatus } from '@/api/apClose'
 import { ElMessage } from 'element-plus'
 import { InfoFilled } from '@element-plus/icons-vue'
 import StepManualPanel from '@/components/StepManualPanel.vue'
@@ -15,6 +15,7 @@ const userStore = useUserStore()
 const currentStepNo = ref(1)
 const stepDetail = ref(null)
 const stepLoading = ref(false)
+const pollTimer = ref(null)
 
 const statusIcon = (s) => {
   if (s === 'COMPLETED') return 'CircleCheckFilled'
@@ -48,13 +49,54 @@ async function selectStep(stepNo) {
   }
 }
 
+function stopPolling() {
+  if (pollTimer.value) {
+    clearInterval(pollTimer.value)
+    pollTimer.value = null
+  }
+}
+
+function startPolling(stepNo) {
+  stopPolling() // 先清除已有的轮询
+  pollTimer.value = setInterval(async () => {
+    try {
+      const res = await getStepStatus(stepNo)
+      if (stepDetail.value) {
+        stepDetail.value.status = res.data.status
+        stepDetail.value.ebsRequestStatus = res.data.ebsRequestStatus
+        stepDetail.value.errorMessage = res.data.errorMessage
+      }
+      apStore.updateTaskStatus(stepNo, res.data.status)
+      if (res.data.status === 'COMPLETED' || res.data.status === 'FAILED') {
+        stopPolling()
+        // 完成后刷新详情（获取输出文件路径等）
+        if (res.data.status === 'COMPLETED') {
+          const detailRes = await getTaskDetail(stepNo)
+          stepDetail.value = detailRes.data
+          ElMessage.success('步骤执行完成')
+        } else {
+          ElMessage.error('步骤执行失败: ' + (res.data.errorMessage || '未知错误'))
+        }
+      }
+    } catch (e) {
+      // 轮询错误静默处理，不打断用户
+    }
+  }, 3000)
+}
+
 async function handleExecute(params) {
   stepLoading.value = true
   try {
     const res = await executeStep(currentStepNo.value, params)
     stepDetail.value = res.data
     if (res.data.status) apStore.updateTaskStatus(currentStepNo.value, res.data.status)
-    ElMessage.success(res.data.message || '操作完成')
+
+    if (res.data.status === 'RUNNING') {
+      ElMessage.info(res.data.message || '请求已提交，正在等待执行完成...')
+      startPolling(currentStepNo.value)
+    } else {
+      ElMessage.success(res.data.message || '操作完成')
+    }
   } catch (e) {
     ElMessage.error('操作失败')
   } finally {
@@ -82,6 +124,10 @@ onMounted(async () => {
     const firstPending = apStore.tasks.find(t => t.status !== 'COMPLETED')
     await selectStep(firstPending ? firstPending.stepNo : 1)
   }
+})
+
+onUnmounted(() => {
+  stopPolling()
 })
 </script>
 

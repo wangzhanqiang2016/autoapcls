@@ -18,6 +18,7 @@ public class ApCloseTask {
     private String status;
     private Long ebsRequestId;
     private String ebsRequestStatus;
+    private String ebsPhaseCode;
     private String outputFilePath;
     private String errorMessage;
     private String paramsJson;

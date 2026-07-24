@@ -12,6 +12,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -197,42 +198,29 @@ public class APCloseService {
                     break;
 
                 case "REPORT_EXPORT":
-                    // Mock: 提交并发请求 → 轮询 → 获取输出文件
+                    // 提交 EBS 并发请求，立即返回 RUNNING，由 pollRunningTasks 轮询完成
                     if (def != null && def.getEbsProgram() != null) {
                         Long requestId = ebsService.submitConcurrentRequest(def.getEbsProgram(), params);
                         task.setEbsRequestId(requestId);
-                        // Mock 直接完成
-                        Map<String, String> status = ebsService.getRequestStatus(requestId);
-                        task.setEbsRequestStatus(status.get("statusCode"));
-                        // Mock 保存文件
-                        byte[] output = ebsService.getRequestOutput(requestId);
-                        String fileName = def.getStepName() + "_" + task.getPeriodName() + ".xlsx";
-                        UserSession session = sessionMapper.selectById(sessionId);
-                        String orgCode = session != null ? session.getSelectedOrgCode() : "UNKNOWN";
-                        fileStorageService.saveFile(orgCode, task.getPeriodName(), stepNo,
-                                task.getId(), requestId, fileName, output, "XLSX");
-                        task.setOutputFilePath(fileStorageService.getClass().getSimpleName()); // placeholder
+                        task.setEbsRequestStatus("SUBMITTED");
+                        task.setEbsPhaseCode("P");
                         result.put("requestId", requestId);
-                        result.put("outputFile", fileName);
                     }
-                    task.setStatus("COMPLETED");
-                    task.setCompletedAt(LocalDateTime.now());
-                    result.put("message", "报表已生成");
+                    task.setStatus("RUNNING");
+                    result.put("message", "请求已提交，正在等待执行完成...");
                     break;
 
                 case "EBS_REQUEST":
-                    // Mock: 提交并发请求
+                    // 提交 EBS 并发请求，立即返回 RUNNING，由 pollRunningTasks 轮询完成
                     if (def != null && def.getEbsProgram() != null) {
                         Long requestId = ebsService.submitConcurrentRequest(def.getEbsProgram(), params);
                         task.setEbsRequestId(requestId);
-                        Map<String, String> status = ebsService.getRequestStatus(requestId);
-                        task.setEbsRequestStatus(status.get("statusCode"));
+                        task.setEbsRequestStatus("SUBMITTED");
+                        task.setEbsPhaseCode("P");
                         result.put("requestId", requestId);
-                        result.put("status", status.get("statusCode"));
                     }
-                    task.setStatus("COMPLETED");
-                    task.setCompletedAt(LocalDateTime.now());
-                    result.put("message", "请求已提交并完成");
+                    task.setStatus("RUNNING");
+                    result.put("message", "请求已提交，正在等待执行完成...");
                     break;
 
                 default:
@@ -290,6 +278,99 @@ public class APCloseService {
         status.put("ebsRequestStatus", task.getEbsRequestStatus());
         status.put("errorMessage", task.getErrorMessage());
         return status;
+    }
+
+    // ──────────── 定时轮询：检查所有 RUNNING 任务 ────────────
+
+    /**
+     * 每 5 秒扫描一次所有 RUNNING 状态的 EBS 请求步骤，
+     * 查询 EBS 并发请求状态，完成后自动标记 COMPLETED 或 FAILED
+     */
+    @Scheduled(fixedDelay = 5000)
+    public void pollRunningTasks() {
+        List<ApCloseTask> runningTasks = taskMapper.selectList(
+                new LambdaQueryWrapper<ApCloseTask>()
+                        .eq(ApCloseTask::getStatus, "RUNNING")
+                        .isNotNull(ApCloseTask::getEbsRequestId)
+        );
+
+        if (runningTasks.isEmpty()) return;
+
+        log.debug("[轮询] 发现 {} 个 RUNNING 任务", runningTasks.size());
+        for (ApCloseTask task : runningTasks) {
+            try {
+                pollSingleTask(task);
+            } catch (Exception e) {
+                log.error("[轮询] 任务 {} 轮询异常: {}", task.getId(), e.getMessage(), e);
+            }
+        }
+    }
+
+    private void pollSingleTask(ApCloseTask task) {
+        Long requestId = task.getEbsRequestId();
+        Map<String, String> status = ebsService.getRequestStatus(requestId);
+
+        String phaseCode = status.get("phaseCode");   // C=Completed, R=Running, P=Pending
+        String statusCode = status.get("statusCode"); // NORMAL, ERROR, WARNING
+
+        task.setEbsRequestStatus(statusCode);
+        task.setEbsPhaseCode(phaseCode);
+
+        if ("C".equals(phaseCode)) {
+            // 请求已完成
+            if ("NORMAL".equals(statusCode)) {
+                // 成功完成 → 如果是 REPORT_EXPORT 类型，获取输出文件
+                handleRequestCompleted(task);
+                task.setStatus("COMPLETED");
+                task.setCompletedAt(LocalDateTime.now());
+                log.info("[轮询] 任务 {} stepNo={} 完成 (requestId={})", task.getId(), task.getStepNo(), requestId);
+            } else {
+                // 完成但有错误
+                task.setStatus("FAILED");
+                task.setErrorMessage("EBS 请求完成但状态异常: " + status.getOrDefault("completionText", statusCode));
+                task.setCompletedAt(LocalDateTime.now());
+                log.warn("[轮询] 任务 {} stepNo={} 失败: {} (requestId={})",
+                        task.getId(), task.getStepNo(), statusCode, requestId);
+            }
+        } else if ("E".equals(phaseCode) || "U".equals(phaseCode)) {
+            // EBS 返回错误或请求未找到
+            task.setStatus("FAILED");
+            task.setErrorMessage(status.getOrDefault("completionText", "EBS 请求状态异常"));
+            task.setCompletedAt(LocalDateTime.now());
+            log.error("[轮询] 任务 {} stepNo={} EBS 异常: phase={}, status={} (requestId={})",
+                    task.getId(), task.getStepNo(), phaseCode, statusCode, requestId);
+        }
+        // R=Running 或 P=Pending → 继续等待，只更新 ebsRequestStatus
+
+        taskMapper.updateById(task);
+    }
+
+    /**
+     * REPORT_EXPORT 类型请求完成后，获取输出文件并保存
+     */
+    private void handleRequestCompleted(ApCloseTask task) {
+        ApCloseStepDef def = stepDefMapper.selectOne(
+                new LambdaQueryWrapper<ApCloseStepDef>()
+                        .eq(ApCloseStepDef::getStepNo, task.getStepNo())
+        );
+        if (def == null || !"REPORT_EXPORT".equals(def.getStepType())) {
+            return; // EBS_REQUEST 类型无需获取文件
+        }
+
+        try {
+            byte[] output = ebsService.getRequestOutput(task.getEbsRequestId());
+            String fileName = def.getStepName() + "_" + task.getPeriodName() + ".xlsx";
+            UserSession session = sessionMapper.selectById(task.getSessionId());
+            String orgCode = session != null ? session.getSelectedOrgCode() : "UNKNOWN";
+            fileStorageService.saveFile(orgCode, task.getPeriodName(), task.getStepNo(),
+                    task.getId(), task.getEbsRequestId(), fileName, output, "XLSX");
+            task.setOutputFilePath(orgCode + "/" + task.getPeriodName() + "/" + fileName);
+            log.info("[轮询] 任务 {} stepNo={} 输出文件已保存: {}", task.getId(), task.getStepNo(), fileName);
+        } catch (Exception e) {
+            log.error("[轮询] 任务 {} stepNo={} 获取输出文件失败: {}",
+                    task.getId(), task.getStepNo(), e.getMessage(), e);
+            // 文件获取失败不影响任务状态（请求本身已成功）
+        }
     }
 
     // 构建步骤默认参数
